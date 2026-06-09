@@ -24,86 +24,128 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i $dest /quiet /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=password123 SET_CONTROLINTERFACE=1 VALUE_OF_CONTROLINTERFACE=0" -Wait
         shell: powershell
 
-      - name: Start TightVNC Server
+      - name: Start and verify TightVNC
         run: |
           Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-          Get-Service -Name "tvnserver" | Select-Object Status, Name
+          Start-Sleep -Seconds 5
+
+          $svc = Get-Service -Name "tvnserver"
+          Write-Host "TightVNC status: $($svc.Status)"
+          if ($svc.Status -ne "Running") {
+            Write-Host "ERROR: TightVNC failed to start!"
+            exit 1
+          }
+
+          # Confirm port 5900 is listening
+          $conn = Test-NetConnection -ComputerName localhost -Port 5900 -WarningAction SilentlyContinue
+          Write-Host "Port 5900 open: $($conn.TcpTestSucceeded)"
         shell: powershell
 
-      - name: Download and setup noVNC
+      - name: Setup noVNC and websockify
         run: |
-          $nvUrl = "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip"
-          $nvDest = "$env:TEMP\novnc.zip"
-          Invoke-WebRequest -Uri $nvUrl -OutFile $nvDest
-          Expand-Archive -Path $nvDest -DestinationPath "C:\novnc_extracted"
+          # noVNC
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "$env:TEMP\novnc.zip"
+          Expand-Archive "$env:TEMP\novnc.zip" -DestinationPath "C:\novnc_extracted"
           Move-Item "C:\novnc_extracted\noVNC-1.4.0" "C:\noVNC"
 
-          $wsUrl = "https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.zip"
-          $wsDest = "$env:TEMP\websockify.zip"
-          Invoke-WebRequest -Uri $wsUrl -OutFile $wsDest
-          Expand-Archive -Path $wsDest -DestinationPath "C:\websockify_extracted"
+          # websockify
+          Invoke-WebRequest -Uri "https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.zip" -OutFile "$env:TEMP\websockify.zip"
+          Expand-Archive "$env:TEMP\websockify.zip" -DestinationPath "C:\websockify_extracted"
           Move-Item "C:\websockify_extracted\websockify-0.11.0" "C:\websockify"
+
+          python -m pip install --upgrade pip -q
+          pip install numpy -q
         shell: powershell
 
-      - name: Install Python dependencies for websockify
+      - name: Start websockify and verify port 6080
         run: |
-          python -m pip install --upgrade pip
-          pip install numpy
+          # noVNC needs its own files served — use websockify's --web flag
+          # This serves noVNC static files AND proxies WebSocket -> VNC
+          $proc = Start-Process python `
+            -ArgumentList "C:\websockify\run --web C:\noVNC 6080 localhost:5900" `
+            -WindowStyle Hidden -PassThru
+          Write-Host "Websockify PID: $($proc.Id)"
+          Start-Sleep -Seconds 5
+
+          # Verify port 6080 is up
+          $conn = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
+          Write-Host "Port 6080 open: $($conn.TcpTestSucceeded)"
+          if (-not $conn.TcpTestSucceeded) {
+            Write-Host "ERROR: websockify not listening on 6080!"
+            exit 1
+          }
+
+          # Quick HTTP check
+          try {
+            $r = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -UseBasicParsing -TimeoutSec 5
+            Write-Host "noVNC HTTP status: $($r.StatusCode)"
+          } catch {
+            Write-Host "HTTP check failed: $_"
+          }
         shell: powershell
 
-      - name: Start websockify (VNC WebSocket proxy on port 6080)
+      - name: Start Cloudflare Tunnel and print URL
         run: |
-          Start-Process python -ArgumentList "C:\websockify\run 6080 localhost:5900" -WindowStyle Hidden
-          Start-Sleep -Seconds 3
-          Write-Host "Websockify started on port 6080"
-        shell: powershell
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-      - name: Download and start cloudflared tunnel (no token needed)
-        run: |
-          # Download cloudflared binary directly — no account or token required
-          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          Invoke-WebRequest -Uri $url -OutFile "C:\cloudflared.exe"
+          # Run in foreground-friendly way: redirect both stdout and stderr to log
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "C:\cloudflared.exe"
+          $psi.Arguments = "tunnel --url http://localhost:6080 --no-autoupdate"
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.UseShellExecute = $false
+          $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
 
-          # Start a quick tunnel on port 6080 (noVNC websockify)
-          # Output is written to a log file so we can parse the URL
-          Start-Process -FilePath "C:\cloudflared.exe" `
-            -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate" `
-            -RedirectStandardError "C:\cf_tunnel.log" `
-            -WindowStyle Hidden
+          $proc = New-Object System.Diagnostics.Process
+          $proc.StartInfo = $psi
 
-          # Wait for the URL to appear in logs (cloudflared prints it to stderr)
-          Write-Host "Waiting for Cloudflare tunnel URL..."
-          $url = $null
+          # Capture output asynchronously
+          $outputLog = [System.Collections.Generic.List[string]]::new()
+          $errorLog  = [System.Collections.Generic.List[string]]::new()
+
+          $proc.add_OutputDataReceived({ param($s,$e) if ($e.Data) { $outputLog.Add($e.Data) } })
+          $proc.add_ErrorDataReceived({  param($s,$e) if ($e.Data) { $errorLog.Add($e.Data)  } })
+
+          $proc.Start() | Out-Null
+          $proc.BeginOutputReadLine()
+          $proc.BeginErrorReadLine()
+
+          Write-Host "cloudflared PID: $($proc.Id)"
+          Write-Host "Waiting for tunnel URL (up to 60s)..."
+
+          $tunnelUrl = $null
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2
-            if (Test-Path "C:\cf_tunnel.log") {
-              $log = Get-Content "C:\cf_tunnel.log" -Raw -ErrorAction SilentlyContinue
-              if ($log -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
-                $url = $matches[0]
+            $allLines = $outputLog + $errorLog
+            foreach ($line in $allLines) {
+              if ($line -match "(https://[a-z0-9\-]+\.trycloudflare\.com)") {
+                $tunnelUrl = $matches[1]
                 break
               }
             }
+            if ($tunnelUrl) { break }
           }
 
-          if ($url) {
-            Write-Host "==========================================="
-            Write-Host "  Open this URL in your browser:"
+          if ($tunnelUrl) {
             Write-Host ""
-            Write-Host "  $url/vnc.html?autoconnect=true&password=password123"
+            Write-Host "==========================================="
+            Write-Host "  OPEN THIS IN YOUR BROWSER:"
+            Write-Host ""
+            Write-Host "  $tunnelUrl/vnc.html?autoconnect=true&password=password123"
             Write-Host ""
             Write-Host "==========================================="
           } else {
-            Write-Host "Could not detect tunnel URL. Dumping log:"
-            Get-Content "C:\cf_tunnel.log"
+            Write-Host "Could not find tunnel URL. Full output:"
+            $outputLog | ForEach-Object { Write-Host "[OUT] $_" }
+            $errorLog  | ForEach-Object { Write-Host "[ERR] $_" }
+            exit 1
           }
-        shell: powershell
 
-      - name: Keep session alive
-        run: |
-          Write-Host "Session is live. Workflow keeps running until timeout."
-          for ($i = 1; $i -le 55; $i++) {
-            Write-Host "[$i/55] Still alive... $(Get-Date -Format 'HH:mm:ss')"
+          # Keep cloudflared alive for the rest of the job
+          # (the process is already running in background; sleep keeps the step open)
+          for ($i = 1; $i -le 54; $i++) {
+            Write-Host "[$i/54] Tunnel alive... $(Get-Date -Format 'HH:mm:ss')"
             Start-Sleep -Seconds 60
           }
         shell: powershell
