@@ -1,41 +1,27 @@
 name: Windows RDP Debug Session
 
 on:
-  workflow_dispatch:       # Trigger manually from the Actions tab
+  workflow_dispatch:
     inputs:
-      ngrok_timeout:
-        description: "How long to keep RDP session alive (seconds). Max ~21600 (6h)"
+      timeout_minutes:
+        description: "Session duration in minutes (max 360)"
         required: false
-        default: "3600"
+        default: "60"
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 360   # 6-hour hard cap (GitHub's max for public repos is 6h)
+    timeout-minutes: 360
 
     steps:
-      # ── 1. Checkout (optional – remove if you just want a bare desktop) ──────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Install your app / dependencies so they're ready to test ──────────
+      # ── Install your app dependencies here if needed ──────────────────────────
       # - name: Install dependencies
-      #   run: npm install          # or whatever your project needs
+      #   run: npm install
 
-      # ── 3. Download & configure ngrok ────────────────────────────────────────
-      #   Store your ngrok authtoken as a GitHub secret: NGROK_AUTH_TOKEN
-      #   Get a free token at https://dashboard.ngrok.com/get-started/your-authtoken
-      - name: Install ngrok
-        run: |
-          choco install ngrok -y
-        shell: powershell
-
-      - name: Authenticate ngrok
-        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-        shell: powershell
-
-      # ── 4. Create a local RDP user ────────────────────────────────────────────
-      #   Store a strong password as a GitHub secret: RDP_PASSWORD
+      # ── Create RDP user ───────────────────────────────────────────────────────
       - name: Create RDP user
         run: |
           $username = "rdpuser"
@@ -45,53 +31,89 @@ jobs:
           net localgroup "Remote Desktop Users" $username /add
         shell: powershell
 
-      # ── 5. Enable Remote Desktop & open the firewall ─────────────────────────
+      # ── Enable Remote Desktop ─────────────────────────────────────────────────
       - name: Enable RDP
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Disable Network Level Authentication so any RDP client connects easily
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0   # disable NLA so any RDP client works
+            -Name "UserAuthentication" -Value 0
         shell: powershell
 
-      # ── 6. Start ngrok TCP tunnel on RDP port 3389 ───────────────────────────
-      - name: Start ngrok tunnel & print connection info
+      # ── Tunnel RDP via localhost.run (free, no account needed) ────────────────
+      # localhost.run uses a plain SSH reverse tunnel — no binary to install,
+      # OpenSSH client is already on every Windows runner.
+      - name: Start localhost.run tunnel & print connection info
         run: |
-          # Start ngrok in background
-          Start-Process -NoNewWindow -FilePath "ngrok" `
-            -ArgumentList "tcp 3389 --log stdout"
+          # Launch SSH tunnel in background; -R forwards remote random port → local 3389
+          # StrictHostKeyChecking=no so it doesn't hang on host key prompt
+          $sshArgs = @(
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=10",
+            "-R", "0:localhost:3389",
+            "nokey@localhost.run",
+            "--",
+            "--output=json"
+          )
+          $proc = Start-Process -NoNewWindow -PassThru `
+            -FilePath "ssh" `
+            -ArgumentList $sshArgs `
+            -RedirectStandardOutput "$env:TEMP\tunnel.log" `
+            -RedirectStandardError  "$env:TEMP\tunnel_err.log"
 
-          # Wait for tunnel to come up
-          Start-Sleep -Seconds 8
+          Write-Host "Waiting for tunnel to establish..."
+          $address = $null
+          $waited  = 0
+          while (-not $address -and $waited -lt 30) {
+            Start-Sleep -Seconds 2
+            $waited += 2
+            if (Test-Path "$env:TEMP\tunnel.log") {
+              $lines = Get-Content "$env:TEMP\tunnel.log" -ErrorAction SilentlyContinue
+              foreach ($line in $lines) {
+                try {
+                  $json = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
+                  if ($json.address) { $address = $json.address; break }
+                } catch {}
+              }
+            }
+          }
 
-          # Fetch the public address from ngrok's local API
-          $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
-          $publicAddr  = $tunnelInfo.tunnels[0].public_url -replace "tcp://", ""
+          if (-not $address) {
+            Write-Host "--- tunnel log ---"
+            Get-Content "$env:TEMP\tunnel.log"    -ErrorAction SilentlyContinue
+            Get-Content "$env:TEMP\tunnel_err.log" -ErrorAction SilentlyContinue
+            throw "Could not retrieve tunnel address after 30s"
+          }
+
+          # address is  hostname:port
+          $parts = $address -split ":"
+          $host_ = $parts[0]
+          $port  = $parts[1]
 
           Write-Host ""
           Write-Host "============================================"
           Write-Host "  RDP CONNECTION DETAILS"
           Write-Host "============================================"
-          Write-Host "  Address  : $publicAddr"
+          Write-Host "  Address  : $address"
           Write-Host "  Username : rdpuser"
           Write-Host "  Password : (your RDP_PASSWORD secret)"
           Write-Host "============================================"
           Write-Host ""
           Write-Host "Connect with:"
-          Write-Host "  Windows : mstsc /v:$publicAddr"
-          Write-Host "  macOS   : Microsoft Remote Desktop → Add PC → $publicAddr"
-          Write-Host "  Linux   : remmina  or  xfreerdp /v:$publicAddr /u:rdpuser"
+          Write-Host "  Windows : mstsc /v:$address"
+          Write-Host "  macOS   : Microsoft Remote Desktop -> Add PC -> $address"
+          Write-Host "  Linux   : xfreerdp /v:$host_ /port:$port /u:rdpuser"
           Write-Host ""
+          Write-Host "Session will stay open for ${{ github.event.inputs.timeout_minutes }} minutes."
+          Write-Host "Cancel this workflow run to disconnect early."
         shell: powershell
 
-      # ── 7. Keep the runner alive while you work ───────────────────────────────
-      #   The job will sit here until the timeout is reached.
-      #   To end the session early: cancel the workflow run from the Actions tab.
+      # ── Keep alive ────────────────────────────────────────────────────────────
       - name: Keep session alive
         run: |
-          $timeout = [int]"${{ github.event.inputs.ngrok_timeout }}"
-          Write-Host "Session will auto-close in $timeout seconds."
-          Write-Host "Cancel this workflow run from the Actions tab to end early."
-          Start-Sleep -Seconds $timeout
+          $seconds = [int]"${{ github.event.inputs.timeout_minutes }}" * 60
+          Start-Sleep -Seconds $seconds
         shell: powershell
