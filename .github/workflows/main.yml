@@ -1,34 +1,19 @@
-name: Windows Desktop via noVNC
+name: Windows Desktop via noVNC (Cloudflare Tunnel)
 
 on:
-  workflow_dispatch: # Manual trigger only
+  workflow_dispatch:
 
 jobs:
   desktop:
     runs-on: windows-latest
-    timeout-minutes: 60 # Adjust as needed (max 360 for paid, 60 for free)
+    timeout-minutes: 60
 
     steps:
-      - name: Enable Remote Desktop (RDP)
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-        shell: powershell
-
       - name: Set password for runner user
         run: |
           $username = $env:USERNAME
           Write-Host "Runner username: $username"
           net user $username "P@ssw0rd123!"
-        shell: powershell
-
-      - name: Install chocolatey packages (VNC server + ngrok)
-        run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          choco install -y ngrok
         shell: powershell
 
       - name: Install TightVNC Server
@@ -42,22 +27,18 @@ jobs:
       - name: Start TightVNC Server
         run: |
           Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
-          # Give it a moment to initialize
           Start-Sleep -Seconds 3
-          # Verify it's running
           Get-Service -Name "tvnserver" | Select-Object Status, Name
         shell: powershell
 
       - name: Download and setup noVNC
         run: |
-          # Download noVNC
           $nvUrl = "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip"
           $nvDest = "$env:TEMP\novnc.zip"
           Invoke-WebRequest -Uri $nvUrl -OutFile $nvDest
           Expand-Archive -Path $nvDest -DestinationPath "C:\novnc_extracted"
           Move-Item "C:\novnc_extracted\noVNC-1.4.0" "C:\noVNC"
 
-          # Download websockify (Python-based websocket proxy for VNC)
           $wsUrl = "https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.zip"
           $wsDest = "$env:TEMP\websockify.zip"
           Invoke-WebRequest -Uri $wsUrl -OutFile $wsDest
@@ -69,44 +50,58 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install numpy
-          # websockify can run standalone via its run script
         shell: powershell
 
-      - name: Start websockify (VNC WebSocket proxy)
+      - name: Start websockify (VNC WebSocket proxy on port 6080)
         run: |
-          # websockify bridges WebSocket (noVNC) <-> raw TCP (VNC on 5900)
           Start-Process python -ArgumentList "C:\websockify\run 6080 localhost:5900" -WindowStyle Hidden
           Start-Sleep -Seconds 3
           Write-Host "Websockify started on port 6080"
         shell: powershell
 
-      - name: Expose noVNC via ngrok
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      - name: Download and start cloudflared tunnel (no token needed)
         run: |
-          # Configure ngrok auth token
-          ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+          # Download cloudflared binary directly — no account or token required
+          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "C:\cloudflared.exe"
 
-          # Start ngrok tunnel on the websockify port
-          Start-Process ngrok -ArgumentList "http 6080" -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+          # Start a quick tunnel on port 6080 (noVNC websockify)
+          # Output is written to a log file so we can parse the URL
+          Start-Process -FilePath "C:\cloudflared.exe" `
+            -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate" `
+            -RedirectStandardError "C:\cf_tunnel.log" `
+            -WindowStyle Hidden
 
-          # Fetch the public URL from ngrok's local API
-          $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
-          $url = $response.tunnels[0].public_url
+          # Wait for the URL to appear in logs (cloudflared prints it to stderr)
+          Write-Host "Waiting for Cloudflare tunnel URL..."
+          $url = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path "C:\cf_tunnel.log") {
+              $log = Get-Content "C:\cf_tunnel.log" -Raw -ErrorAction SilentlyContinue
+              if ($log -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
+                $url = $matches[0]
+                break
+              }
+            }
+          }
 
-          # Convert http -> https if needed (ngrok always provides https)
-          Write-Host "==========================================="
-          Write-Host "noVNC URL (open in browser):"
-          Write-Host "$url/vnc.html?autoconnect=true&password=password123"
-          Write-Host "==========================================="
+          if ($url) {
+            Write-Host "==========================================="
+            Write-Host "  Open this URL in your browser:"
+            Write-Host ""
+            Write-Host "  $url/vnc.html?autoconnect=true&password=password123"
+            Write-Host ""
+            Write-Host "==========================================="
+          } else {
+            Write-Host "Could not detect tunnel URL. Dumping log:"
+            Get-Content "C:\cf_tunnel.log"
+          }
         shell: powershell
 
       - name: Keep session alive
         run: |
-          Write-Host "Session is live. Sleeping to keep the runner alive..."
-          Write-Host "The workflow will auto-cancel after the timeout-minutes limit."
-          # Sleep in chunks so logs stay active (GitHub cuts idle jobs)
+          Write-Host "Session is live. Workflow keeps running until timeout."
           for ($i = 1; $i -le 55; $i++) {
             Write-Host "[$i/55] Still alive... $(Get-Date -Format 'HH:mm:ss')"
             Start-Sleep -Seconds 60
