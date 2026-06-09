@@ -1,0 +1,97 @@
+name: Windows RDP Debug Session
+
+on:
+  workflow_dispatch:       # Trigger manually from the Actions tab
+    inputs:
+      ngrok_timeout:
+        description: "How long to keep RDP session alive (seconds). Max ~21600 (6h)"
+        required: false
+        default: "3600"
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360   # 6-hour hard cap (GitHub's max for public repos is 6h)
+
+    steps:
+      # ── 1. Checkout (optional – remove if you just want a bare desktop) ──────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Install your app / dependencies so they're ready to test ──────────
+      # - name: Install dependencies
+      #   run: npm install          # or whatever your project needs
+
+      # ── 3. Download & configure ngrok ────────────────────────────────────────
+      #   Store your ngrok authtoken as a GitHub secret: NGROK_AUTH_TOKEN
+      #   Get a free token at https://dashboard.ngrok.com/get-started/your-authtoken
+      - name: Install ngrok
+        run: |
+          choco install ngrok -y
+        shell: powershell
+
+      - name: Authenticate ngrok
+        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+        shell: powershell
+
+      # ── 4. Create a local RDP user ────────────────────────────────────────────
+      #   Store a strong password as a GitHub secret: RDP_PASSWORD
+      - name: Create RDP user
+        run: |
+          $username = "rdpuser"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          net user $username $password /add
+          net localgroup Administrators $username /add
+          net localgroup "Remote Desktop Users" $username /add
+        shell: powershell
+
+      # ── 5. Enable Remote Desktop & open the firewall ─────────────────────────
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0   # disable NLA so any RDP client works
+        shell: powershell
+
+      # ── 6. Start ngrok TCP tunnel on RDP port 3389 ───────────────────────────
+      - name: Start ngrok tunnel & print connection info
+        run: |
+          # Start ngrok in background
+          Start-Process -NoNewWindow -FilePath "ngrok" `
+            -ArgumentList "tcp 3389 --log stdout"
+
+          # Wait for tunnel to come up
+          Start-Sleep -Seconds 8
+
+          # Fetch the public address from ngrok's local API
+          $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
+          $publicAddr  = $tunnelInfo.tunnels[0].public_url -replace "tcp://", ""
+
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "  RDP CONNECTION DETAILS"
+          Write-Host "============================================"
+          Write-Host "  Address  : $publicAddr"
+          Write-Host "  Username : rdpuser"
+          Write-Host "  Password : (your RDP_PASSWORD secret)"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "Connect with:"
+          Write-Host "  Windows : mstsc /v:$publicAddr"
+          Write-Host "  macOS   : Microsoft Remote Desktop → Add PC → $publicAddr"
+          Write-Host "  Linux   : remmina  or  xfreerdp /v:$publicAddr /u:rdpuser"
+          Write-Host ""
+        shell: powershell
+
+      # ── 7. Keep the runner alive while you work ───────────────────────────────
+      #   The job will sit here until the timeout is reached.
+      #   To end the session early: cancel the workflow run from the Actions tab.
+      - name: Keep session alive
+        run: |
+          $timeout = [int]"${{ github.event.inputs.ngrok_timeout }}"
+          Write-Host "Session will auto-close in $timeout seconds."
+          Write-Host "Cancel this workflow run from the Actions tab to end early."
+          Start-Sleep -Seconds $timeout
+        shell: powershell
