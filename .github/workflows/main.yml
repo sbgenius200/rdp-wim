@@ -17,10 +17,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Install your app dependencies here if needed ──────────────────────────
-      # - name: Install dependencies
-      #   run: npm install
-
       # ── Create RDP user ───────────────────────────────────────────────────────
       - name: Create RDP user
         run: |
@@ -46,15 +42,13 @@ jobs:
         run: |
           $tempLog = "$env:TEMP\tunnel_all.log"
 
-          # Use cmd /c so we can redirect stderr→stdout with 2>&1 into one file
           $cmdLine = "ssh -o StrictHostKeyChecking=no " + `
                      "-o ServerAliveInterval=30 " + `
                      "-o ServerAliveCountMax=720 " + `
                      "-R 0:localhost:3389 " + `
                      "nokey@localhost.run > `"$tempLog`" 2>&1"
 
-          Start-Process -NoNewWindow -FilePath "cmd.exe" `
-            -ArgumentList "/c", $cmdLine
+          Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/c", $cmdLine
 
           Write-Host "Waiting for tunnel to establish..."
           $address = $null
@@ -65,11 +59,30 @@ jobs:
             $waited += 2
 
             if (Test-Path $tempLog) {
-              $content = Get-Content $tempLog -Raw -ErrorAction SilentlyContinue
-              # localhost.run prints: "Allocated port 12345 for remote forward to localhost:3389"
-              if ($content -match "Allocated port (\d+) for remote forward") {
-                $port    = $Matches[1]
-                $address = "localhost.run:$port"
+              # Print log each iteration so we can see what's coming in
+              $lines = Get-Content $tempLog -ErrorAction SilentlyContinue
+
+              foreach ($line in $lines) {
+                Write-Host "  [log] $line"
+
+                # Match lines like:
+                #   "Allocated port 12345 for remote forward to localhost:3389"
+                # but ONLY when port is non-zero
+                if ($line -match "Allocated port (\d+) for remote forward" -and [int]$Matches[1] -ne 0) {
+                  $port    = $Matches[1]
+                  $address = "localhost.run:$port"
+                  break
+                }
+
+                # Fallback: some versions print a hostname like:
+                #   "Connect to tcp://abc.localhost.run:12345"  or
+                #   "forwarding TCP connections from tcp://abc.lhr.life:12345"
+                if ($line -match "tcp://([^\s:]+):(\d+)") {
+                  $host_ = $Matches[1]
+                  $port  = $Matches[2]
+                  $address = "${host_}:${port}"
+                  break
+                }
               }
             }
           }
@@ -80,7 +93,9 @@ jobs:
             throw "Could not determine tunnel address after 60s"
           }
 
-          $host_ = "localhost.run"
+          $parts = $address -split ":"
+          $host_ = $parts[0]
+          $port  = $parts[1]
 
           Write-Host ""
           Write-Host "============================================"
