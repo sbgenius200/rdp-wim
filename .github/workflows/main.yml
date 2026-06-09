@@ -42,27 +42,19 @@ jobs:
         shell: powershell
 
       # ── Tunnel RDP via localhost.run ──────────────────────────────────────────
-      # localhost.run outputs the assigned address to STDERR in plain text like:
-      #   "1.lhr.life tunneled with tls termination, https://..."  (HTTP mode)
-      # For raw TCP it prints: "Allocated port NNNNN for remote forward to localhost:3389"
-      # We parse that line from stderr to extract the port, then build the address.
       - name: Start localhost.run tunnel & print connection info
         run: |
-          # Merge stderr into stdout so we can capture everything in one file
-          # ssh -R 0:localhost:3389  → let server pick a free port
           $tempLog = "$env:TEMP\tunnel_all.log"
 
-          $proc = Start-Process -NoNewWindow -PassThru `
-            -FilePath "ssh" `
-            -ArgumentList @(
-              "-o", "StrictHostKeyChecking=no",
-              "-o", "ServerAliveInterval=30",
-              "-o", "ServerAliveCountMax=720",
-              "-R", "0:localhost:3389",
-              "nokey@localhost.run"
-            ) `
-            -RedirectStandardOutput $tempLog `
-            -RedirectStandardError  $tempLog
+          # Use cmd /c so we can redirect stderr→stdout with 2>&1 into one file
+          $cmdLine = "ssh -o StrictHostKeyChecking=no " + `
+                     "-o ServerAliveInterval=30 " + `
+                     "-o ServerAliveCountMax=720 " + `
+                     "-R 0:localhost:3389 " + `
+                     "nokey@localhost.run > `"$tempLog`" 2>&1"
+
+          Start-Process -NoNewWindow -FilePath "cmd.exe" `
+            -ArgumentList "/c", $cmdLine
 
           Write-Host "Waiting for tunnel to establish..."
           $address = $null
@@ -74,8 +66,7 @@ jobs:
 
             if (Test-Path $tempLog) {
               $content = Get-Content $tempLog -Raw -ErrorAction SilentlyContinue
-              # localhost.run TCP line looks like:
-              #   Allocated port 12345 for remote forward to localhost:3389
+              # localhost.run prints: "Allocated port 12345 for remote forward to localhost:3389"
               if ($content -match "Allocated port (\d+) for remote forward") {
                 $port    = $Matches[1]
                 $address = "localhost.run:$port"
@@ -89,9 +80,7 @@ jobs:
             throw "Could not determine tunnel address after 60s"
           }
 
-          $parts = $address -split ":"
-          $host_ = $parts[0]
-          $port  = $parts[1]
+          $host_ = "localhost.run"
 
           Write-Host ""
           Write-Host "============================================"
