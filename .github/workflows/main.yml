@@ -37,58 +37,58 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Disable Network Level Authentication so any RDP client connects easily
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" -Value 0
         shell: powershell
 
-      # ── Tunnel RDP via localhost.run (free, no account needed) ────────────────
-      # localhost.run uses a plain SSH reverse tunnel — no binary to install,
-      # OpenSSH client is already on every Windows runner.
+      # ── Tunnel RDP via localhost.run ──────────────────────────────────────────
+      # localhost.run outputs the assigned address to STDERR in plain text like:
+      #   "1.lhr.life tunneled with tls termination, https://..."  (HTTP mode)
+      # For raw TCP it prints: "Allocated port NNNNN for remote forward to localhost:3389"
+      # We parse that line from stderr to extract the port, then build the address.
       - name: Start localhost.run tunnel & print connection info
         run: |
-          # Launch SSH tunnel in background; -R forwards remote random port → local 3389
-          # StrictHostKeyChecking=no so it doesn't hang on host key prompt
-          $sshArgs = @(
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=10",
-            "-R", "0:localhost:3389",
-            "nokey@localhost.run",
-            "--",
-            "--output=json"
-          )
+          # Merge stderr into stdout so we can capture everything in one file
+          # ssh -R 0:localhost:3389  → let server pick a free port
+          $tempLog = "$env:TEMP\tunnel_all.log"
+
           $proc = Start-Process -NoNewWindow -PassThru `
             -FilePath "ssh" `
-            -ArgumentList $sshArgs `
-            -RedirectStandardOutput "$env:TEMP\tunnel.log" `
-            -RedirectStandardError  "$env:TEMP\tunnel_err.log"
+            -ArgumentList @(
+              "-o", "StrictHostKeyChecking=no",
+              "-o", "ServerAliveInterval=30",
+              "-o", "ServerAliveCountMax=720",
+              "-R", "0:localhost:3389",
+              "nokey@localhost.run"
+            ) `
+            -RedirectStandardOutput $tempLog `
+            -RedirectStandardError  $tempLog
 
           Write-Host "Waiting for tunnel to establish..."
           $address = $null
           $waited  = 0
-          while (-not $address -and $waited -lt 30) {
+
+          while (-not $address -and $waited -lt 60) {
             Start-Sleep -Seconds 2
             $waited += 2
-            if (Test-Path "$env:TEMP\tunnel.log") {
-              $lines = Get-Content "$env:TEMP\tunnel.log" -ErrorAction SilentlyContinue
-              foreach ($line in $lines) {
-                try {
-                  $json = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
-                  if ($json.address) { $address = $json.address; break }
-                } catch {}
+
+            if (Test-Path $tempLog) {
+              $content = Get-Content $tempLog -Raw -ErrorAction SilentlyContinue
+              # localhost.run TCP line looks like:
+              #   Allocated port 12345 for remote forward to localhost:3389
+              if ($content -match "Allocated port (\d+) for remote forward") {
+                $port    = $Matches[1]
+                $address = "localhost.run:$port"
               }
             }
           }
 
           if (-not $address) {
-            Write-Host "--- tunnel log ---"
-            Get-Content "$env:TEMP\tunnel.log"    -ErrorAction SilentlyContinue
-            Get-Content "$env:TEMP\tunnel_err.log" -ErrorAction SilentlyContinue
-            throw "Could not retrieve tunnel address after 30s"
+            Write-Host "=== Full tunnel log ==="
+            Get-Content $tempLog -ErrorAction SilentlyContinue
+            throw "Could not determine tunnel address after 60s"
           }
 
-          # address is  hostname:port
           $parts = $address -split ":"
           $host_ = $parts[0]
           $port  = $parts[1]
@@ -115,5 +115,6 @@ jobs:
       - name: Keep session alive
         run: |
           $seconds = [int]"${{ github.event.inputs.timeout_minutes }}" * 60
+          Write-Host "Sleeping for $seconds seconds. Cancel the run to end early."
           Start-Sleep -Seconds $seconds
         shell: powershell
