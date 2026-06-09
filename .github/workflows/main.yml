@@ -22,130 +22,95 @@ jobs:
           $dest = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest -Uri $url -OutFile $dest
           Start-Process msiexec.exe -ArgumentList "/i $dest /quiet /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=password123 SET_CONTROLINTERFACE=1 VALUE_OF_CONTROLINTERFACE=0" -Wait
-        shell: powershell
-
-      - name: Start and verify TightVNC
-        run: |
-          Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
-
+          Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
           $svc = Get-Service -Name "tvnserver"
           Write-Host "TightVNC status: $($svc.Status)"
-          if ($svc.Status -ne "Running") {
-            Write-Host "ERROR: TightVNC failed to start!"
-            exit 1
-          }
-
-          # Confirm port 5900 is listening
-          $conn = Test-NetConnection -ComputerName localhost -Port 5900 -WarningAction SilentlyContinue
-          Write-Host "Port 5900 open: $($conn.TcpTestSucceeded)"
+          if ($svc.Status -ne "Running") { Write-Host "ERROR: TightVNC not running!"; exit 1 }
         shell: powershell
 
-      - name: Setup noVNC and websockify
+      - name: Install websockify via pip
         run: |
-          # noVNC
+          python -m pip install websockify --quiet
+          python -m websockify --version
+        shell: powershell
+
+      - name: Download noVNC
+        run: |
           Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.zip" -OutFile "$env:TEMP\novnc.zip"
-          Expand-Archive "$env:TEMP\novnc.zip" -DestinationPath "C:\novnc_extracted"
-          Move-Item "C:\novnc_extracted\noVNC-1.4.0" "C:\noVNC"
-
-          # websockify
-          Invoke-WebRequest -Uri "https://github.com/novnc/websockify/archive/refs/tags/v0.11.0.zip" -OutFile "$env:TEMP\websockify.zip"
-          Expand-Archive "$env:TEMP\websockify.zip" -DestinationPath "C:\websockify_extracted"
-          Move-Item "C:\websockify_extracted\websockify-0.11.0" "C:\websockify"
-
-          python -m pip install --upgrade pip -q
-          pip install numpy -q
+          Expand-Archive "$env:TEMP\novnc.zip" -DestinationPath "C:\"
+          Rename-Item "C:\noVNC-1.4.0" "C:\noVNC"
+          Write-Host "noVNC ready at C:\noVNC"
+          Test-Path "C:\noVNC\vnc.html"
         shell: powershell
 
-      - name: Start websockify and verify port 6080
+      - name: Start websockify + noVNC + cloudflared (all in one step)
         run: |
-          # noVNC needs its own files served — use websockify's --web flag
-          # This serves noVNC static files AND proxies WebSocket -> VNC
-          $proc = Start-Process python `
-            -ArgumentList "C:\websockify\run --web C:\noVNC 6080 localhost:5900" `
+          # --- 1. Start websockify serving noVNC on port 6080 ---
+          $ws = Start-Process python `
+            -ArgumentList "-m websockify --web C:\noVNC 6080 localhost:5900" `
             -WindowStyle Hidden -PassThru
-          Write-Host "Websockify PID: $($proc.Id)"
-          Start-Sleep -Seconds 5
+          Write-Host "websockify PID: $($ws.Id)"
+          Start-Sleep -Seconds 6
 
-          # Verify port 6080 is up
-          $conn = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
-          Write-Host "Port 6080 open: $($conn.TcpTestSucceeded)"
+          # Verify websockify is up
+          $conn = Test-NetConnection localhost -Port 6080 -WarningAction SilentlyContinue
           if (-not $conn.TcpTestSucceeded) {
-            Write-Host "ERROR: websockify not listening on 6080!"
+            Write-Host "ERROR: websockify not listening on port 6080"
             exit 1
           }
+          Write-Host "websockify is UP on port 6080"
 
           # Quick HTTP check
-          try {
-            $r = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -UseBasicParsing -TimeoutSec 5
-            Write-Host "noVNC HTTP status: $($r.StatusCode)"
-          } catch {
-            Write-Host "HTTP check failed: $_"
-          }
-        shell: powershell
+          $r = Invoke-WebRequest "http://localhost:6080/vnc.html" -UseBasicParsing
+          Write-Host "noVNC HTTP check: $($r.StatusCode)"
 
-      - name: Start Cloudflare Tunnel and print URL
-        run: |
+          # --- 2. Download cloudflared ---
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
 
-          # Run in foreground-friendly way: redirect both stdout and stderr to log
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = "C:\cloudflared.exe"
-          $psi.Arguments = "tunnel --url http://localhost:6080 --no-autoupdate"
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $psi.UseShellExecute = $false
-          $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+          # --- 3. Launch cloudflared, capture output to file ---
+          $cfLog = "C:\cf.log"
+          $cf = Start-Process "C:\cloudflared.exe" `
+            -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate --logfile $cfLog --loglevel info" `
+            -WindowStyle Hidden -PassThru
+          Write-Host "cloudflared PID: $($cf.Id)"
 
-          $proc = New-Object System.Diagnostics.Process
-          $proc.StartInfo = $psi
-
-          # Capture output asynchronously
-          $outputLog = [System.Collections.Generic.List[string]]::new()
-          $errorLog  = [System.Collections.Generic.List[string]]::new()
-
-          $proc.add_OutputDataReceived({ param($s,$e) if ($e.Data) { $outputLog.Add($e.Data) } })
-          $proc.add_ErrorDataReceived({  param($s,$e) if ($e.Data) { $errorLog.Add($e.Data)  } })
-
-          $proc.Start() | Out-Null
-          $proc.BeginOutputReadLine()
-          $proc.BeginErrorReadLine()
-
-          Write-Host "cloudflared PID: $($proc.Id)"
-          Write-Host "Waiting for tunnel URL (up to 60s)..."
-
+          # --- 4. Wait for URL in log file ---
           $tunnelUrl = $null
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 2
-            $allLines = $outputLog + $errorLog
-            foreach ($line in $allLines) {
-              if ($line -match "(https://[a-z0-9\-]+\.trycloudflare\.com)") {
-                $tunnelUrl = $matches[1]
+          Write-Host "Waiting for tunnel URL..."
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 3
+            if (Test-Path $cfLog) {
+              $content = Get-Content $cfLog -Raw -ErrorAction SilentlyContinue
+              if ($content -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
+                $tunnelUrl = $Matches[0]
                 break
               }
             }
-            if ($tunnelUrl) { break }
           }
 
-          if ($tunnelUrl) {
-            Write-Host ""
-            Write-Host "==========================================="
-            Write-Host "  OPEN THIS IN YOUR BROWSER:"
-            Write-Host ""
-            Write-Host "  $tunnelUrl/vnc.html?autoconnect=true&password=password123"
-            Write-Host ""
-            Write-Host "==========================================="
-          } else {
-            Write-Host "Could not find tunnel URL. Full output:"
-            $outputLog | ForEach-Object { Write-Host "[OUT] $_" }
-            $errorLog  | ForEach-Object { Write-Host "[ERR] $_" }
+          if (-not $tunnelUrl) {
+            Write-Host "=== cloudflared log ==="
+            Get-Content $cfLog -ErrorAction SilentlyContinue
+            Write-Host "ERROR: Could not get tunnel URL"
             exit 1
           }
 
-          # Keep cloudflared alive for the rest of the job
-          # (the process is already running in background; sleep keeps the step open)
+          Write-Host ""
+          Write-Host "==========================================="
+          Write-Host " OPEN THIS IN YOUR BROWSER:"
+          Write-Host ""
+          Write-Host " $tunnelUrl/vnc.html?autoconnect=true&password=password123"
+          Write-Host ""
+          Write-Host "==========================================="
+
+          # --- 5. Keep everything alive ---
           for ($i = 1; $i -le 54; $i++) {
-            Write-Host "[$i/54] Tunnel alive... $(Get-Date -Format 'HH:mm:ss')"
+            # Check both processes are still alive
+            if ($ws.HasExited) { Write-Host "WARNING: websockify died! Restarting..."; $ws = Start-Process python -ArgumentList "-m websockify --web C:\noVNC 6080 localhost:5900" -WindowStyle Hidden -PassThru }
+            if ($cf.HasExited) { Write-Host "WARNING: cloudflared died! Restarting..."; $cf = Start-Process "C:\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate" -WindowStyle Hidden -PassThru }
+            Write-Host "[$i/54] alive | ws:$(-not $ws.HasExited) cf:$(-not $cf.HasExited) | $(Get-Date -Format 'HH:mm:ss')"
             Start-Sleep -Seconds 60
           }
         shell: powershell
