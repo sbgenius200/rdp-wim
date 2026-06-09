@@ -20,11 +20,9 @@ jobs:
       # ── Create RDP user ───────────────────────────────────────────────────────
       - name: Create RDP user
         run: |
-          $username = "rdpuser"
-          $password = "${{ secrets.RDP_PASSWORD }}"
-          net user $username $password /add
-          net localgroup Administrators $username /add
-          net localgroup "Remote Desktop Users" $username /add
+          net user rdpuser "${{ secrets.RDP_PASSWORD }}" /add
+          net localgroup Administrators rdpuser /add
+          net localgroup "Remote Desktop Users" rdpuser /add
         shell: powershell
 
       # ── Enable Remote Desktop ─────────────────────────────────────────────────
@@ -37,88 +35,86 @@ jobs:
             -Name "UserAuthentication" -Value 0
         shell: powershell
 
-      # ── Tunnel RDP via localhost.run ──────────────────────────────────────────
-      - name: Start localhost.run tunnel & print connection info
+      # ── Install cloudflared ───────────────────────────────────────────────────
+      - name: Install cloudflared
         run: |
-          $tempLog = "$env:TEMP\tunnel_all.log"
+          $url  = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $dest = "C:\cloudflared.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dest
+          Write-Host "cloudflared downloaded."
+        shell: powershell
 
-          $cmdLine = "ssh -o StrictHostKeyChecking=no " + `
-                     "-o ServerAliveInterval=30 " + `
-                     "-o ServerAliveCountMax=720 " + `
-                     "-R 0:localhost:3389 " + `
-                     "nokey@localhost.run > `"$tempLog`" 2>&1"
+      # ── Start Cloudflare TCP tunnel on port 3389 ──────────────────────────────
+      # cloudflared tunnel --url tcp://localhost:3389
+      # prints a line like:  INF +----------------------------+
+      #                           |  https://xxxx.trycloudflare.com  |
+      # We parse that URL, then the user connects via:
+      #   cloudflared access tcp --hostname xxxx.trycloudflare.com --url localhost:PORT
+      # on their LOCAL machine (no account needed on either side).
+      - name: Start cloudflared tunnel & print connection info
+        run: |
+          $tempLog = "$env:TEMP\cf_tunnel.log"
 
+          # Launch tunnel in background, merge stderr+stdout via cmd 2>&1
+          $cmdLine = "C:\cloudflared.exe tunnel --url tcp://localhost:3389 > `"$tempLog`" 2>&1"
           Start-Process -NoNewWindow -FilePath "cmd.exe" -ArgumentList "/c", $cmdLine
 
-          Write-Host "Waiting for tunnel to establish..."
-          $address = $null
-          $waited  = 0
+          Write-Host "Waiting for tunnel URL..."
+          $tunnelUrl = $null
+          $waited    = 0
 
-          while (-not $address -and $waited -lt 60) {
+          while (-not $tunnelUrl -and $waited -lt 60) {
             Start-Sleep -Seconds 2
             $waited += 2
 
             if (Test-Path $tempLog) {
-              # Print log each iteration so we can see what's coming in
-              $lines = Get-Content $tempLog -ErrorAction SilentlyContinue
-
-              foreach ($line in $lines) {
-                Write-Host "  [log] $line"
-
-                # Match lines like:
-                #   "Allocated port 12345 for remote forward to localhost:3389"
-                # but ONLY when port is non-zero
-                if ($line -match "Allocated port (\d+) for remote forward" -and [int]$Matches[1] -ne 0) {
-                  $port    = $Matches[1]
-                  $address = "localhost.run:$port"
-                  break
-                }
-
-                # Fallback: some versions print a hostname like:
-                #   "Connect to tcp://abc.localhost.run:12345"  or
-                #   "forwarding TCP connections from tcp://abc.lhr.life:12345"
-                if ($line -match "tcp://([^\s:]+):(\d+)") {
-                  $host_ = $Matches[1]
-                  $port  = $Matches[2]
-                  $address = "${host_}:${port}"
-                  break
-                }
+              $content = Get-Content $tempLog -Raw -ErrorAction SilentlyContinue
+              # cloudflared prints the public URL like:
+              #   https://something-something.trycloudflare.com
+              if ($content -match "https://[a-z0-9\-]+\.trycloudflare\.com") {
+                $tunnelUrl = $Matches[0]
               }
             }
           }
 
-          if (-not $address) {
-            Write-Host "=== Full tunnel log ==="
+          if (-not $tunnelUrl) {
+            Write-Host "=== Full cloudflared log ==="
             Get-Content $tempLog -ErrorAction SilentlyContinue
-            throw "Could not determine tunnel address after 60s"
+            throw "Could not get tunnel URL after 60s"
           }
 
-          $parts = $address -split ":"
-          $host_ = $parts[0]
-          $port  = $parts[1]
+          $hostname = $tunnelUrl -replace "https://", ""
 
           Write-Host ""
-          Write-Host "============================================"
-          Write-Host "  RDP CONNECTION DETAILS"
-          Write-Host "============================================"
-          Write-Host "  Address  : $address"
+          Write-Host "================================================================="
+          Write-Host "  RDP CONNECTION DETAILS  (via Cloudflare Tunnel)"
+          Write-Host "================================================================="
+          Write-Host "  Tunnel URL : $tunnelUrl"
+          Write-Host "  Username   : rdpuser"
+          Write-Host "  Password   : (your RDP_PASSWORD secret)"
+          Write-Host "================================================================="
+          Write-Host ""
+          Write-Host "STEP 1 — Install cloudflared on YOUR machine (one-time):"
+          Write-Host "  Windows : winget install Cloudflare.cloudflared"
+          Write-Host "  macOS   : brew install cloudflared"
+          Write-Host "  Linux   : https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+          Write-Host ""
+          Write-Host "STEP 2 — Run this command in a terminal on YOUR machine:"
+          Write-Host "  cloudflared access tcp --hostname $hostname --url localhost:13389"
+          Write-Host ""
+          Write-Host "STEP 3 — Open RDP client and connect to:"
+          Write-Host "  Address  : localhost:13389"
           Write-Host "  Username : rdpuser"
           Write-Host "  Password : (your RDP_PASSWORD secret)"
-          Write-Host "============================================"
-          Write-Host ""
-          Write-Host "Connect with:"
-          Write-Host "  Windows : mstsc /v:$address"
-          Write-Host "  macOS   : Microsoft Remote Desktop -> Add PC -> $address"
-          Write-Host "  Linux   : xfreerdp /v:$host_ /port:$port /u:rdpuser"
           Write-Host ""
           Write-Host "Session will stay open for ${{ github.event.inputs.timeout_minutes }} minutes."
-          Write-Host "Cancel this workflow run to disconnect early."
+          Write-Host "Cancel this workflow run to end early."
         shell: powershell
 
       # ── Keep alive ────────────────────────────────────────────────────────────
       - name: Keep session alive
         run: |
           $seconds = [int]"${{ github.event.inputs.timeout_minutes }}" * 60
-          Write-Host "Sleeping for $seconds seconds. Cancel the run to end early."
+          Write-Host "Sleeping $seconds seconds. Cancel this run to disconnect early."
           Start-Sleep -Seconds $seconds
         shell: powershell
